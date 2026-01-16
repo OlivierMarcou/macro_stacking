@@ -1,4 +1,3 @@
-// src/main/java/com/macrostacking/ImageStacker.java
 package com.macrostacking;
 
 import java.awt.image.BufferedImage;
@@ -320,8 +319,9 @@ public class ImageStacker {
     private BufferedImage stackDepthMapParallel(BufferedImage[] images) throws Exception {
         BufferedImage result = new BufferedImage(finalWidth, finalHeight, BufferedImage.TYPE_INT_RGB);
 
-        progressCallback.update(50, "Calcul carte de profondeur...");
+        progressCallback.update(50, "Calcul carte de profondeur optimisée...");
         int[][] bestImage = new int[finalHeight][finalWidth];
+        double[][] sharpnessValues = new double[finalHeight][finalWidth];
 
         List<WorkBand> bands = createWorkBands(finalHeight, threadCount);
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
@@ -331,30 +331,41 @@ public class ImageStacker {
 
         for (WorkBand band : bands) {
             futures.add(executor.submit(() -> {
-                for (int y = band.startY; y < band.endY; y++) {
-                    for (int x = 0; x < finalWidth; x++) {
-                        double maxSharpness = -1;
-                        int bestIdx = 0;
+                try {
+                    for (int y = band.startY; y < band.endY; y++) {
+                        for (int x = 0; x < finalWidth; x++) {
+                            double maxSharpness = -1;
+                            int bestIdx = 0;
 
-                        for (int i = 0; i < images.length; i++) {
-                            int rgb = images[i].getRGB(x, y);
-                            if (rgb == 0xFF000000 || rgb == 0) continue;
+                            for (int i = 0; i < images.length; i++) {
+                                int rgb = images[i].getRGB(x, y);
+                                if (rgb == 0xFF000000 || rgb == 0) continue;
 
-                            double sharpness = calculateSharpness(images[i], x, y, 5);
-                            if (sharpness > maxSharpness) {
-                                maxSharpness = sharpness;
-                                bestIdx = i;
+                                double contrast3 = calculateLocalContrast(images[i], x, y, 3);
+                                double contrast7 = calculateLocalContrast(images[i], x, y, 7);
+                                double laplacian = Math.abs(calculateLaplacian(images[i], x, y));
+
+                                double sharpness = contrast3 * 0.5 + contrast7 * 0.3 + laplacian * 2.0;
+
+                                if (sharpness > maxSharpness) {
+                                    maxSharpness = sharpness;
+                                    bestIdx = i;
+                                }
                             }
+
+                            bestImage[y][x] = bestIdx;
+                            sharpnessValues[y][x] = maxSharpness;
                         }
 
-                        bestImage[y][x] = bestIdx;
+                        int completed = processedLines.incrementAndGet();
+                        if (completed % 50 == 0) {
+                            int progress = 50 + (completed * 25 / finalHeight);
+                            progressCallback.update(progress, "Profondeur: " + (completed * 100 / finalHeight) + "%");
+                        }
                     }
-
-                    int completed = processedLines.incrementAndGet();
-                    if (completed % 100 == 0) {
-                        progressCallback.update(50 + (completed * 25 / finalHeight),
-                                "Profondeur: " + (completed * 100 / finalHeight) + "%");
-                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    throw new RuntimeException(e);
                 }
             }));
         }
@@ -363,45 +374,39 @@ public class ImageStacker {
             future.get();
         }
 
-        progressCallback.update(75, "Lissage...");
+        progressCallback.update(75, "Lissage médian...");
+        int[][] smoothed = medianFilterDepthMapSimple(bestImage, 5);
+
+        progressCallback.update(85, "Assemblage final...");
         futures.clear();
         processedLines.set(0);
 
         for (WorkBand band : bands) {
             futures.add(executor.submit(() -> {
-                int smoothRadius = 5;
-                for (int y = band.startY; y < band.endY; y++) {
-                    for (int x = 0; x < finalWidth; x++) {
-                        int[] histogram = new int[images.length];
+                try {
+                    for (int y = band.startY; y < band.endY; y++) {
+                        for (int x = 0; x < finalWidth; x++) {
+                            int selectedImage = smoothed[y][x];
 
-                        for (int dy = -smoothRadius; dy <= smoothRadius; dy++) {
-                            for (int dx = -smoothRadius; dx <= smoothRadius; dx++) {
-                                int ny = Math.max(0, Math.min(finalHeight - 1, y + dy));
-                                int nx = Math.max(0, Math.min(finalWidth - 1, x + dx));
-                                histogram[bestImage[ny][nx]]++;
+                            if (isEdgePixel(smoothed, x, y)) {
+                                result.setRGB(x, y, blendEdgePixelSimple(images, smoothed, x, y));
+                            } else {
+                                int rgb = images[selectedImage].getRGB(x, y);
+                                if (rgb != 0xFF000000 && rgb != 0) {
+                                    result.setRGB(x, y, rgb);
+                                }
                             }
                         }
 
-                        int maxCount = 0;
-                        int mostFrequent = bestImage[y][x];
-                        for (int i = 0; i < histogram.length; i++) {
-                            if (histogram[i] > maxCount) {
-                                maxCount = histogram[i];
-                                mostFrequent = i;
-                            }
-                        }
-
-                        int rgb = images[mostFrequent].getRGB(x, y);
-                        if (rgb != 0xFF000000 && rgb != 0) {
-                            result.setRGB(x, y, rgb);
+                        int completed = processedLines.incrementAndGet();
+                        if (completed % 50 == 0) {
+                            int progress = 85 + (completed * 15 / finalHeight);
+                            progressCallback.update(progress, "Assemblage: " + (completed * 100 / finalHeight) + "%");
                         }
                     }
-
-                    int completed = processedLines.incrementAndGet();
-                    if (completed % 100 == 0) {
-                        progressCallback.update(75 + (completed * 25 / finalHeight),
-                                "Assemblage: " + (completed * 100 / finalHeight) + "%");
-                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    throw new RuntimeException(e);
                 }
             }));
         }
@@ -412,6 +417,93 @@ public class ImageStacker {
 
         executor.shutdown();
         return result;
+    }
+
+    private int[][] medianFilterDepthMapSimple(int[][] depthMap, int radius) {
+        int height = depthMap.length;
+        int width = depthMap[0].length;
+        int[][] result = new int[height][width];
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                List<Integer> values = new ArrayList<>();
+
+                for (int dy = -radius; dy <= radius; dy++) {
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        int ny = Math.max(0, Math.min(height - 1, y + dy));
+                        int nx = Math.max(0, Math.min(width - 1, x + dx));
+                        values.add(depthMap[ny][nx]);
+                    }
+                }
+
+                values.sort(Integer::compareTo);
+                result[y][x] = values.get(values.size() / 2);
+            }
+
+            if (y % 100 == 0) {
+                progressCallback.update(75 + (y * 10 / height), "Lissage: " + (y * 100 / height) + "%");
+            }
+        }
+
+        return result;
+    }
+
+    private boolean isEdgePixel(int[][] depthMap, int x, int y) {
+        int height = depthMap.length;
+        int width = depthMap[0].length;
+
+        if (x == 0 || y == 0 || x >= width - 1 || y >= height - 1) {
+            return false;
+        }
+
+        int center = depthMap[y][x];
+
+        return depthMap[y-1][x] != center ||
+                depthMap[y+1][x] != center ||
+                depthMap[y][x-1] != center ||
+                depthMap[y][x+1] != center;
+    }
+
+    private int blendEdgePixelSimple(BufferedImage[] images, int[][] depthMap, int x, int y) {
+        int height = depthMap.length;
+        int width = depthMap[0].length;
+
+        int[] counts = new int[images.length];
+
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int ny = Math.max(0, Math.min(height - 1, y + dy));
+                int nx = Math.max(0, Math.min(width - 1, x + dx));
+                counts[depthMap[ny][nx]]++;
+            }
+        }
+
+        int first = 0, second = 0;
+        int firstCount = 0, secondCount = 0;
+
+        for (int i = 0; i < counts.length; i++) {
+            if (counts[i] > firstCount) {
+                second = first;
+                secondCount = firstCount;
+                first = i;
+                firstCount = counts[i];
+            } else if (counts[i] > secondCount) {
+                second = i;
+                secondCount = counts[i];
+            }
+        }
+
+        int rgb1 = images[first].getRGB(x, y);
+        int rgb2 = images[second].getRGB(x, y);
+
+        if (rgb1 == 0xFF000000 || rgb1 == 0) return rgb2;
+        if (rgb2 == 0xFF000000 || rgb2 == 0) return rgb1;
+
+        int r = ((rgb1 >> 16) & 0xFF + (rgb2 >> 16) & 0xFF) / 2;
+        int g = ((rgb1 >> 8) & 0xFF + (rgb2 >> 8) & 0xFF) / 2;
+        int b = ((rgb1 & 0xFF) + (rgb2 & 0xFF)) / 2;
+
+        return (r << 16) | (g << 8) | b;
     }
 
     private BufferedImage stackPyramidParallel(BufferedImage[] images) throws Exception {
